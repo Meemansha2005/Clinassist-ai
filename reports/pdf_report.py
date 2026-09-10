@@ -1,571 +1,1021 @@
+# reports/pdf_report.py
+
 from pathlib import Path
-from datetime import datetime
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (
-    SimpleDocTemplate,
     Paragraph,
     Spacer,
     Table,
     TableStyle,
+    SimpleDocTemplate,
+    KeepTogether,
 )
 
 
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def _safe_text(value, default="N/A"):
+    """Convert any value into safe text for the PDF."""
+    if value is None:
+        return default
+
+    if isinstance(value, (list, tuple, set)):
+        if not value:
+            return default
+        return ", ".join(_safe_text(item, "") for item in value)
+
+    if isinstance(value, dict):
+        if not value:
+            return default
+        return ", ".join(
+            f"{key}: {_safe_text(val, '')}"
+            for key, val in value.items()
+        )
+
+    text = str(value).strip()
+
+    if not text or text.lower() in {"none", "null", "nan"}:
+        return default
+
+    return text
+
+
+def _get_first(data, keys, default="N/A"):
+    """Return the first meaningful value found for the supplied keys."""
+    if not isinstance(data, dict):
+        return default
+
+    for key in keys:
+        if key in data:
+            value = data.get(key)
+
+            if value is None:
+                continue
+
+            if isinstance(value, str) and not value.strip():
+                continue
+
+            if isinstance(value, (list, tuple, set, dict)) and not value:
+                continue
+
+            return value
+
+    return default
+
+
+def _paragraph_text(value, default="N/A"):
+    """Escape text before sending it to ReportLab Paragraph."""
+    return escape(_safe_text(value, default))
+
+
+def _normalize_score(score):
+    """Convert model score into a readable percentage."""
+    try:
+        score = float(score)
+
+        # Model probabilities are normally 0-1.
+        if 0 <= score <= 1:
+            score *= 100
+
+        return f"{score:.2f}%"
+
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _normalize_prediction(prediction):
+    """
+    Convert different prediction formats into:
+    (condition, probability)
+    """
+
+    # Dictionary format
+    if isinstance(prediction, dict):
+
+        condition = _get_first(
+            prediction,
+            [
+                "condition",
+                "disease",
+                "name",
+                "label",
+                "Disease",
+                "Condition",
+            ],
+            "N/A",
+        )
+
+        probability = _get_first(
+            prediction,
+            [
+                "probability",
+                "confidence",
+                "score",
+                "Probability",
+                "Confidence",
+            ],
+            None,
+        )
+
+        return (
+            _safe_text(condition),
+            _normalize_score(probability),
+        )
+
+    # Tuple/list format
+    if isinstance(prediction, (tuple, list)):
+
+        if len(prediction) >= 2:
+            return (
+                _safe_text(prediction[0]),
+                _normalize_score(prediction[1]),
+            )
+
+        if len(prediction) == 1:
+            return (
+                _safe_text(prediction[0]),
+                "N/A",
+            )
+
+    # Plain string
+    return (
+        _safe_text(prediction),
+        "N/A",
+    )
+
+
+def _normalize_list(value):
+    """Convert symptoms/flags into a clean list."""
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+
+        if not value.strip():
+            return []
+
+        # Handle comma-separated strings.
+        return [
+            item.strip()
+            for item in value.split(",")
+            if item.strip()
+        ]
+
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _safe_text(item, "")
+            for item in value
+            if _safe_text(item, "")
+        ]
+
+    return [_safe_text(value)]
+
+
+# ============================================================
+# REPORT SCHEMA NORMALIZATION
+# ============================================================
+
+def _normalize_report(report):
+    """
+    Supports both report formats used by ClinAssist.
+
+    New/legacy PDF format:
+        {
+            "patient": {...},
+            "analysis": {...},
+            "assessment": {...}
+        }
+
+    Clinical report format:
+        {
+            "patient_information": {...},
+            "clinical_history": {...},
+            "ai_analysis": {...},
+            "urgency_review": {...},
+            "doctor_assessment": {...}
+        }
+    """
+
+    if not isinstance(report, dict):
+        report = {}
+
+    # --------------------------------------------------------
+    # PATIENT
+    # --------------------------------------------------------
+
+    patient = report.get("patient")
+
+    if not isinstance(patient, dict) or not patient:
+        patient = report.get("patient_information", {})
+
+    if not isinstance(patient, dict):
+        patient = {}
+
+    # --------------------------------------------------------
+    # CLINICAL HISTORY
+    # --------------------------------------------------------
+
+    history = report.get("clinical_history", {})
+
+    if not isinstance(history, dict):
+        history = {}
+
+    # Some reports keep clinical history directly inside patient.
+    # Merge only missing fields.
+    for key, value in patient.items():
+        if key not in history:
+            history[key] = value
+
+    # --------------------------------------------------------
+    # ANALYSIS
+    # --------------------------------------------------------
+
+    analysis = report.get("analysis")
+
+    if not isinstance(analysis, dict) or not analysis:
+        analysis = report.get("ai_analysis", {})
+
+    if not isinstance(analysis, dict):
+        analysis = {}
+
+    # --------------------------------------------------------
+    # URGENCY
+    # --------------------------------------------------------
+
+    urgency = report.get("urgency_review")
+
+    if urgency is None:
+        urgency = analysis.get("urgency", {})
+
+    if urgency is None:
+        urgency = {}
+
+    # --------------------------------------------------------
+    # ASSESSMENT
+    # --------------------------------------------------------
+
+    assessment = report.get("assessment")
+
+    if assessment is None:
+        assessment = report.get("doctor_assessment")
+
+    return {
+        "title": report.get(
+            "title",
+            "ClinAssist - Clinical Decision Support Report",
+        ),
+        "generated_at": report.get("generated_at", ""),
+        "patient": patient,
+        "history": history,
+        "analysis": analysis,
+        "urgency": urgency,
+        "assessment": assessment,
+        "disclaimer": report.get(
+            "disclaimer",
+            "This report is an AI-assisted clinical decision-support "
+            "document. It does not replace professional medical judgment.",
+        ),
+    }
+
+
+# ============================================================
+# PDF EXPORT
+# ============================================================
+
 def export_report_to_pdf(report, output_path):
     """
-    Convert a ClinAssist clinical report dictionary into a PDF file.
+    Generate a professional ClinAssist clinical report PDF.
+
+    Parameters
+    ----------
+    report : dict
+        Clinical report dictionary.
+
+    output_path : str or Path
+        Destination path for the PDF.
+
+    Returns
+    -------
+    str
+        Generated PDF path.
     """
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = _normalize_report(report)
 
-    document = SimpleDocTemplate(
+    patient = normalized["patient"]
+    history = normalized["history"]
+    analysis = normalized["analysis"]
+    urgency = normalized["urgency"]
+    assessment = normalized["assessment"]
+
+    output_path = Path(output_path)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================
+    # DOCUMENT
+    # ========================================================
+
+    doc = SimpleDocTemplate(
         str(output_path),
         pagesize=A4,
-        rightMargin=18 * mm,
-        leftMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title="ClinAssist Clinical Report",
+        author="ClinAssist AI",
     )
 
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "TitleStyle",
+        "ClinAssistTitle",
         parent=styles["Title"],
         alignment=TA_CENTER,
-        fontSize=20,
-        spaceAfter=6,
+        fontSize=18,
+        leading=22,
+        spaceAfter=5 * mm,
     )
 
     subtitle_style = ParagraphStyle(
-        "SubtitleStyle",
+        "ClinAssistSubtitle",
         parent=styles["Normal"],
         alignment=TA_CENTER,
-        fontSize=10,
-        spaceAfter=15,
+        fontSize=9,
+        leading=12,
+        textColor=colors.grey,
+        spaceAfter=7 * mm,
     )
 
-    heading_style = ParagraphStyle(
-        "HeadingStyle",
+    section_style = ParagraphStyle(
+        "SectionHeading",
         parent=styles["Heading2"],
-        fontSize=13,
-        spaceBefore=10,
-        spaceAfter=7,
+        fontSize=12,
+        leading=15,
+        spaceBefore=5 * mm,
+        spaceAfter=3 * mm,
     )
 
     normal_style = ParagraphStyle(
-        "NormalStyle",
+        "NormalText",
         parent=styles["Normal"],
         fontSize=9.5,
-        leading=14,
-        spaceAfter=4,
+        leading=13,
+        spaceAfter=2 * mm,
     )
 
     small_style = ParagraphStyle(
-        "SmallStyle",
+        "SmallText",
         parent=styles["Normal"],
         fontSize=8,
         leading=11,
     )
 
+    disclaimer_style = ParagraphStyle(
+        "Disclaimer",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=11,
+        textColor=colors.grey,
+        spaceBefore=5 * mm,
+    )
+
     story = []
 
-    # ---------------------------------------------------------
+    # ========================================================
     # HEADER
-    # ---------------------------------------------------------
-
-    story.append(Paragraph("CLINASSIST", title_style))
-    story.append(
-        Paragraph(
-            "Clinical Assessment Report",
-            subtitle_style,
-        )
-    )
-
-    generated = report.get(
-        "generated_at",
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    # ========================================================
 
     story.append(
         Paragraph(
-            f"<b>Generated:</b> {generated}",
-            normal_style,
+            _paragraph_text(
+                normalized["title"],
+                "ClinAssist - Clinical Decision Support Report",
+            ),
+            title_style,
         )
     )
 
-    story.append(Spacer(1, 5))
+    generated_at = normalized["generated_at"]
 
-    # ---------------------------------------------------------
+    if generated_at:
+        story.append(
+            Paragraph(
+                f"Generated: {_paragraph_text(generated_at)}",
+                subtitle_style,
+            )
+        )
+
+    # ========================================================
     # PATIENT INFORMATION
-    # ---------------------------------------------------------
+    # ========================================================
 
     story.append(
         Paragraph(
-            "1. PATIENT INFORMATION",
-            heading_style,
+            "1. Patient Information",
+            section_style,
         )
     )
 
-    patient = report.get("patient", {})
+    patient_id = _get_first(
+        patient,
+        [
+            "id",
+            "patient_id",
+            "Patient ID",
+        ],
+    )
 
-    patient_data = [
-        ["Patient ID", str(patient.get("id", patient.get("patient_id", "N/A")))],
-        ["Name", str(patient.get("name", "N/A"))],
-        ["Age", str(patient.get("age", "N/A"))],
-        ["Gender", str(patient.get("gender", "N/A"))],
+    name = _get_first(
+        patient,
+        [
+            "name",
+            "patient_name",
+            "Name",
+            "Patient Name",
+        ],
+    )
+
+    age = _get_first(
+        patient,
+        [
+            "age",
+            "Age",
+        ],
+    )
+
+    gender = _get_first(
+        patient,
+        [
+            "gender",
+            "sex",
+            "Gender",
+            "Sex",
+        ],
+    )
+
+    patient_table_data = [
+        [
+            Paragraph("<b>Patient ID</b>", small_style),
+            Paragraph(_paragraph_text(patient_id), small_style),
+        ],
+        [
+            Paragraph("<b>Name</b>", small_style),
+            Paragraph(_paragraph_text(name), small_style),
+        ],
+        [
+            Paragraph("<b>Age</b>", small_style),
+            Paragraph(_paragraph_text(age), small_style),
+        ],
+        [
+            Paragraph("<b>Gender</b>", small_style),
+            Paragraph(_paragraph_text(gender), small_style),
+        ],
     ]
 
     patient_table = Table(
-        patient_data,
-        colWidths=[45 * mm, 120 * mm],
+        patient_table_data,
+        colWidths=[45 * mm, 125 * mm],
     )
 
     patient_table.setStyle(
         TableStyle(
             [
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("PADDING", (0, 0), (-1, -1), 6),
+                ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]
         )
     )
 
     story.append(patient_table)
 
-    # ---------------------------------------------------------
+    # ========================================================
     # CLINICAL HISTORY
-    # ---------------------------------------------------------
+    # ========================================================
 
     story.append(
         Paragraph(
-            "2. CLINICAL HISTORY",
-            heading_style,
+            "2. Clinical History",
+            section_style,
         )
     )
 
-    history_data = [
+    presenting_complaint = _get_first(
+        history,
         [
+            "presenting_complaint",
+            "complaint",
+            "chief_complaint",
             "Presenting Complaint",
-            str(patient.get("complaint", "N/A")),
+            "Complaint",
         ],
+    )
+
+    duration = _get_first(
+        history,
         [
+            "duration",
+            "symptom_duration",
             "Duration",
-            str(patient.get("duration", "N/A")),
         ],
+    )
+
+    severity = _get_first(
+        history,
         [
+            "severity",
             "Severity",
-            str(patient.get("severity", "N/A")),
         ],
+    )
+
+    additional_symptoms = _get_first(
+        history,
         [
+            "additional_symptoms",
             "Additional Symptoms",
-            str(patient.get("additional_symptoms", "N/A")),
         ],
+    )
+
+    past_history = _get_first(
+        history,
         [
+            "past_history",
+            "medical_history",
+            "past_medical_history",
             "Past History",
-            str(patient.get("past_history", "N/A")),
         ],
+    )
+
+    medications = _get_first(
+        history,
         [
+            "medications",
+            "current_medications",
+            "Medication",
             "Medications",
-            str(patient.get("medications", "N/A")),
+        ],
+    )
+
+    allergies = _get_first(
+        history,
+        [
+            "allergies",
+            "drug_allergies",
+            "Allergies",
+        ],
+    )
+
+    history_rows = [
+        [
+            Paragraph("<b>Presenting Complaint</b>", small_style),
+            Paragraph(
+                _paragraph_text(presenting_complaint),
+                small_style,
+            ),
         ],
         [
-            "Allergies",
-            str(patient.get("allergies", "N/A")),
+            Paragraph("<b>Duration</b>", small_style),
+            Paragraph(
+                _paragraph_text(duration),
+                small_style,
+            ),
+        ],
+        [
+            Paragraph("<b>Severity</b>", small_style),
+            Paragraph(
+                _paragraph_text(severity),
+                small_style,
+            ),
+        ],
+        [
+            Paragraph("<b>Additional Symptoms</b>", small_style),
+            Paragraph(
+                _paragraph_text(additional_symptoms),
+                small_style,
+            ),
+        ],
+        [
+            Paragraph("<b>Past Medical History</b>", small_style),
+            Paragraph(
+                _paragraph_text(past_history),
+                small_style,
+            ),
+        ],
+        [
+            Paragraph("<b>Medications</b>", small_style),
+            Paragraph(
+                _paragraph_text(medications),
+                small_style,
+            ),
+        ],
+        [
+            Paragraph("<b>Allergies</b>", small_style),
+            Paragraph(
+                _paragraph_text(allergies),
+                small_style,
+            ),
         ],
     ]
 
+    # --------------------------------------------------------
+    # Adaptive questions
+    # --------------------------------------------------------
+
+    adaptive = history.get("adaptive_questions", {})
+
+    if not isinstance(adaptive, dict):
+        adaptive = {}
+
+    adaptive_field_map = [
+        ("pain_location", "Pain Location"),
+        ("head_associated", "Associated Head Symptoms"),
+        ("cough_type", "Cough Type"),
+        ("breathing", "Breathing"),
+        ("food_relation", "Relation to Food"),
+        ("vomiting", "Vomiting"),
+        ("skin_appearance", "Skin Appearance"),
+        ("skin_duration", "Skin Duration"),
+        ("additional_details", "Additional Details"),
+    ]
+
+    for key, label in adaptive_field_map:
+
+        value = adaptive.get(key)
+
+        if value is None:
+            value = history.get(key)
+
+        if value is None:
+            continue
+
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        history_rows.append(
+            [
+                Paragraph(
+                    f"<b>{escape(label)}</b>",
+                    small_style,
+                ),
+                Paragraph(
+                    _paragraph_text(value),
+                    small_style,
+                ),
+            ]
+        )
+
     history_table = Table(
-        history_data,
-        colWidths=[50 * mm, 115 * mm],
+        history_rows,
+        colWidths=[55 * mm, 115 * mm],
     )
 
     history_table.setStyle(
         TableStyle(
             [
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("PADDING", (0, 0), (-1, -1), 6),
+                ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]
         )
     )
 
     story.append(history_table)
 
-    # ---------------------------------------------------------
+    # ========================================================
     # AI ANALYSIS
-    # ---------------------------------------------------------
+    # ========================================================
 
     story.append(
         Paragraph(
-            "3. AI-ASSISTED ANALYSIS",
-            heading_style,
+            "3. AI-Assisted Analysis",
+            section_style,
         )
     )
 
-    analysis = report.get("analysis", {})
-
-    detected_symptoms = analysis.get("symptoms", [])
-
-    story.append(
-        Paragraph(
-            "<b>Detected Symptoms</b>",
-            normal_style,
-        )
+    detected_symptoms = _get_first(
+        analysis,
+        [
+            "symptoms",
+            "detected_symptoms",
+            "Detected Symptoms",
+        ],
+        [],
     )
+
+    detected_symptoms = _normalize_list(detected_symptoms)
 
     if detected_symptoms:
-        for symptom in detected_symptoms:
-            story.append(
-                Paragraph(
-                    f"- {symptom}",
-                    normal_style,
-                )
-            )
-    else:
-        story.append(
-            Paragraph(
-                "No symptoms were automatically detected.",
-                normal_style,
-            )
+
+        symptom_text = ", ".join(
+            escape(symptom)
+            for symptom in detected_symptoms
         )
 
-    story.append(Spacer(1, 5))
+    else:
+        symptom_text = "No symptoms detected"
 
     story.append(
         Paragraph(
-            "<b>Possible Conditions to Consider</b>",
+            f"<b>Detected Symptoms:</b> {symptom_text}",
             normal_style,
         )
     )
 
-    predictions = analysis.get("predictions", [])
+    # ========================================================
+    # POSSIBLE CONDITIONS
+    # ========================================================
 
-    if predictions:
-        prediction_data = [
-            ["Rank", "Condition", "Model Score"]
+    predictions = _get_first(
+        analysis,
+        [
+            "predictions",
+            "possible_conditions",
+            "Possible Conditions",
+        ],
+        [],
+    )
+
+    if predictions is None:
+        predictions = []
+
+    if not isinstance(predictions, (list, tuple)):
+        predictions = [predictions]
+
+    prediction_rows = [
+        [
+            Paragraph("<b>Possible Condition</b>", small_style),
+            Paragraph("<b>Model Score</b>", small_style),
         ]
+    ]
 
-        for index, prediction in enumerate(predictions, start=1):
-            condition = prediction.get(
-                "condition",
-                prediction.get("name", "Unknown"),
-            )
+    for prediction in predictions:
 
-            score = prediction.get(
-                "score",
-                prediction.get("probability", 0),
-            )
-
-            try:
-                score_text = f"{float(score):.2f}%"
-            except (TypeError, ValueError):
-                score_text = str(score)
-
-            prediction_data.append(
-                [
-                    str(index),
-                    str(condition),
-                    score_text,
-                ]
-            )
-
-        prediction_table = Table(
-            prediction_data,
-            colWidths=[20 * mm, 105 * mm, 40 * mm],
+        condition, probability = _normalize_prediction(
+            prediction
         )
 
-        prediction_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                    ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                    ("ALIGN", (-1, 0), (-1, -1), "CENTER"),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("PADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
+        prediction_rows.append(
+            [
+                Paragraph(
+                    escape(condition),
+                    small_style,
+                ),
+                Paragraph(
+                    escape(probability),
+                    small_style,
+                ),
+            ]
         )
 
-        story.append(prediction_table)
-
-    else:
-        story.append(
-            Paragraph(
-                "No model predictions available.",
-                normal_style,
-            )
+    if len(prediction_rows) == 1:
+        prediction_rows.append(
+            [
+                Paragraph(
+                    "No model predictions available",
+                    small_style,
+                ),
+                Paragraph(
+                    "N/A",
+                    small_style,
+                ),
+            ]
         )
 
-    # ---------------------------------------------------------
-    # URGENCY REVIEW
-    # ---------------------------------------------------------
+    prediction_table = Table(
+        prediction_rows,
+        colWidths=[125 * mm, 45 * mm],
+    )
 
-    story.append(
-        Paragraph(
-            "4. URGENCY REVIEW",
-            heading_style,
+    prediction_table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
         )
     )
 
-    urgency = analysis.get("urgency", {})
+    story.append(prediction_table)
 
-    urgent = urgency.get("urgent", False)
-    flags = urgency.get("flags", [])
+    # ========================================================
+    # URGENCY REVIEW
+    # ========================================================
 
-    if urgent:
+    story.append(
+        Paragraph(
+            "4. Urgency Review",
+            section_style,
+        )
+    )
+
+    urgent = False
+    urgency_flags = []
+    urgency_message = ""
+
+    if isinstance(urgency, dict):
+
+        urgent = bool(
+            urgency.get(
+                "urgent",
+                urgency.get("is_urgent", False),
+            )
+        )
+
+        urgency_flags = _normalize_list(
+            urgency.get(
+                "flags",
+                urgency.get("urgency_flags", []),
+            )
+        )
+
+        urgency_message = _safe_text(
+            urgency.get(
+                "message",
+                urgency.get("recommendation", ""),
+            ),
+            "",
+        )
+
+    elif isinstance(urgency, str):
+
+        urgency_message = urgency
+
+    urgency_status = "Urgent review recommended" if urgent else "No urgent flag identified"
+
+    story.append(
+        Paragraph(
+            f"<b>Status:</b> {escape(urgency_status)}",
+            normal_style,
+        )
+    )
+
+    if urgency_flags:
+
         story.append(
             Paragraph(
-                "<b>Potential urgency indicators detected.</b>",
+                "<b>Flags:</b> "
+                + ", ".join(
+                    escape(flag)
+                    for flag in urgency_flags
+                ),
                 normal_style,
             )
         )
 
-        for flag in flags:
+    if urgency_message:
+
+        story.append(
+            Paragraph(
+                f"<b>Message:</b> {escape(urgency_message)}",
+                normal_style,
+            )
+        )
+
+    # ========================================================
+    # DOCTOR ASSESSMENT
+    # ========================================================
+
+    story.append(
+        Paragraph(
+            "5. Doctor Assessment",
+            section_style,
+        )
+    )
+
+    if isinstance(assessment, dict):
+
+        assessment_text = _get_first(
+            assessment,
+            [
+                "assessment",
+                "clinical_assessment",
+                "doctor_assessment",
+                "Assessment",
+                "Clinical Assessment",
+            ],
+            "",
+        )
+
+        notes = _get_first(
+            assessment,
+            [
+                "notes",
+                "doctor_notes",
+                "additional_notes",
+                "Notes",
+                "Doctor Notes",
+            ],
+            "",
+        )
+
+        impression = _get_first(
+            assessment,
+            [
+                "impression",
+                "clinical_impression",
+                "Impression",
+            ],
+            "",
+        )
+
+        if assessment_text:
             story.append(
                 Paragraph(
-                    f"- {flag}",
+                    f"<b>Assessment:</b> "
+                    f"{escape(_safe_text(assessment_text, 'N/A'))}",
                     normal_style,
                 )
             )
-    else:
+
+        if impression:
+            story.append(
+                Paragraph(
+                    f"<b>Clinical Impression:</b> "
+                    f"{escape(_safe_text(impression, 'N/A'))}",
+                    normal_style,
+                )
+            )
+
+        if notes:
+            story.append(
+                Paragraph(
+                    f"<b>Notes:</b> "
+                    f"{escape(_safe_text(notes, 'N/A'))}",
+                    normal_style,
+                )
+            )
+
+        if not assessment_text and not impression and not notes:
+
+            story.append(
+                Paragraph(
+                    "Doctor assessment not yet recorded.",
+                    normal_style,
+                )
+            )
+
+    elif assessment:
+
         story.append(
             Paragraph(
-                "No predefined urgency indicators detected.",
+                escape(_safe_text(assessment)),
                 normal_style,
             )
         )
-
-    message = urgency.get("message")
-
-    if message:
-        story.append(
-            Spacer(1, 3)
-        )
-        story.append(
-            Paragraph(
-                f"<b>Review message:</b> {message}",
-                normal_style,
-            )
-        )
-
-    # ---------------------------------------------------------
-    # DOCTOR ASSESSMENT
-    # ---------------------------------------------------------
-
-    story.append(
-        Paragraph(
-            "5. DOCTOR ASSESSMENT",
-            heading_style,
-        )
-    )
-
-    assessment = report.get("assessment")
-
-    if assessment:
-        assessment_data = [
-            [
-                "Doctor",
-                str(assessment.get("doctor_name", "N/A")),
-            ],
-            [
-                "Confirmed Condition",
-                str(
-                    assessment.get(
-                        "confirmed_condition",
-                        "Not specified",
-                    )
-                ),
-            ],
-            [
-                "Final Assessment",
-                str(
-                    assessment.get(
-                        "final_assessment",
-                        "N/A",
-                    )
-                ),
-            ],
-            [
-                "Doctor Notes",
-                str(
-                    assessment.get(
-                        "doctor_notes",
-                        "N/A",
-                    )
-                ),
-            ],
-            [
-                "Follow-up",
-                str(
-                    assessment.get(
-                        "follow_up",
-                        "N/A",
-                    )
-                ),
-            ],
-        ]
-
-        assessment_table = Table(
-            assessment_data,
-            colWidths=[50 * mm, 115 * mm],
-        )
-
-        assessment_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("PADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
-        )
-
-        story.append(assessment_table)
 
     else:
+
         story.append(
             Paragraph(
-                "Doctor assessment has not been completed.",
+                "Doctor assessment not yet recorded.",
                 normal_style,
             )
         )
 
-    # ---------------------------------------------------------
+    # ========================================================
     # DISCLAIMER
-    # ---------------------------------------------------------
+    # ========================================================
 
-    story.append(Spacer(1, 15))
-
-    story.append(
-        Paragraph(
-            "IMPORTANT",
-            heading_style,
-        )
-    )
+    story.append(Spacer(1, 5 * mm))
 
     story.append(
         Paragraph(
-            "AI-generated information is intended only to support "
-            "clinical review and does not replace professional "
-            "clinical judgment, diagnosis, or treatment decisions.",
-            small_style,
+            f"<b>Important:</b> "
+            f"{escape(_safe_text(normalized['disclaimer']))}",
+            disclaimer_style,
         )
     )
 
-    # ---------------------------------------------------------
+    # ========================================================
     # BUILD PDF
-    # ---------------------------------------------------------
+    # ========================================================
 
-    document.build(story)
+    doc.build(story)
 
-    return output_path
-
-
-# -------------------------------------------------------------
-# STANDALONE TEST
-# -------------------------------------------------------------
-
-if __name__ == "__main__":
-
-    sample_report = {
-        "generated_at": datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-
-        "patient": {
-            "id": 1,
-            "name": "Test Patient",
-            "age": 25,
-            "gender": "Female",
-            "complaint": "Headache",
-            "duration": "2 days",
-            "severity": "Moderate",
-            "additional_symptoms": "Nausea and fatigue",
-            "past_history": "None",
-            "medications": "None",
-            "allergies": "None",
-        },
-
-        "analysis": {
-            "symptoms": [
-                "headache",
-                "nausea",
-                "fatigue",
-            ],
-
-            "predictions": [
-                {
-                    "condition": "Example Condition 1",
-                    "score": 35.50,
-                },
-                {
-                    "condition": "Example Condition 2",
-                    "score": 22.30,
-                },
-                {
-                    "condition": "Example Condition 3",
-                    "score": 12.80,
-                },
-            ],
-
-            "urgency": {
-                "urgent": False,
-                "flags": [],
-                "message": "No predefined urgency indicators detected.",
-            },
-        },
-
-        "assessment": {
-            "doctor_name": "Dr. Test",
-            "confirmed_condition": "Example Condition 1",
-            "final_assessment": (
-                "Patient history reviewed and clinical "
-                "assessment completed."
-            ),
-            "doctor_notes": (
-                "Doctor reviewed the patient's reported symptoms."
-            ),
-            "follow_up": (
-                "Follow-up according to clinical assessment."
-            ),
-        },
-    }
-
-    output_file = (
-        Path(__file__).parent
-        / "output"
-        / "clinassist_test_report.pdf"
-    )
-
-    export_report_to_pdf(
-        sample_report,
-        output_file,
-    )
-
-    print("=================================")
-    print("CLINASSIST PDF REPORT TEST")
-    print("=================================")
-    print()
-    print("PDF generated successfully!")
-    print(f"Location: {output_file}")
-    print()
-    print("PDF REPORT TEST COMPLETED")
+    return str(output_path)
