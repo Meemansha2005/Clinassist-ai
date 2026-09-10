@@ -1,6 +1,9 @@
+import io
+import hashlib
 import streamlit as st
 import pandas as pd
 import joblib
+import speech_recognition as sr
 from pathlib import Path
 
 from database.database import initialize_database, save_patient, get_doctor_assessment, save_doctor_assessment
@@ -48,6 +51,7 @@ DEFAULTS = {
     "pdf_path": None,
     "language": "English",
     "voice_message": "",
+    "voice_audio_hash": "",
     "ocr_uploaded_name": "",
     "ocr_extracted_text": "",
     "ocr_summary": "",
@@ -321,27 +325,12 @@ def process_ocr(uploaded_file):
         st.session_state.ocr_error = f"Could not analyze the document: {exc}"
 
 
-def use_voice_input():
-    if not VOICE_AVAILABLE:
-        st.session_state.voice_message = "Voice input is unavailable. You can continue using text input."
-        return
-    try:
-        language_code = get_voice_language(st.session_state.language)
-        recognized = speech_to_text(language=language_code)
-        if is_successful(recognized):
-            text = str(recognized).strip()
-            if text:
-                st.session_state.patient["complaint"] = text
-                types = detect_problem_types(text)
-                st.session_state.patient["problem_types"] = types
-                st.session_state.patient["problem_type"] = types[0]
-                st.session_state.voice_message = "Voice input captured successfully."
-            else:
-                st.session_state.voice_message = "No voice text was captured."
-        else:
-            st.session_state.voice_message = "Could not understand the voice input."
-    except Exception as exc:
-        st.session_state.voice_message = f"Voice input error: {exc}"
+def recognize_browser_audio(audio_value, language_code):
+    recognizer = sr.Recognizer()
+    audio_bytes = audio_value.getvalue()
+    with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+        audio_data = recognizer.record(source)
+    return recognizer.recognize_google(audio_data, language=language_code).strip()
 
 
 def render_prediction_table(predictions):
@@ -570,12 +559,49 @@ elif st.session_state.current_step == 2:
                 st.session_state.voice_message = ""
                 st.rerun()
 
-    if st.button("🎤 Use Voice Input", key="voice_input", width="stretch"):
-        use_voice_input()
-        st.rerun()
+    st.markdown("### 🎤 Voice Input")
+    st.caption("Record your complaint using your browser microphone. Hindi speech is recognized in Hindi (Devanagari).")
+    audio_value = st.audio_input(
+        "Record your complaint",
+        sample_rate=16000,
+        key="voice_recording",
+    )
+
+    if audio_value is not None:
+        audio_bytes = audio_value.getvalue()
+        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+        if audio_hash != st.session_state.voice_audio_hash:
+            st.session_state.voice_audio_hash = audio_hash
+            language_code = get_voice_language(st.session_state.language)
+
+            try:
+                recognized_text = recognize_browser_audio(
+                    audio_value,
+                    language_code,
+                )
+
+                if recognized_text:
+                    st.session_state.patient["complaint"] = recognized_text
+                    types = detect_problem_types(recognized_text)
+                    st.session_state.patient["problem_types"] = types
+                    st.session_state.patient["problem_type"] = types[0]
+                    st.session_state.voice_message = "Voice input captured successfully."
+                    st.rerun()
+                else:
+                    st.session_state.voice_message = "No voice text was captured."
+            except sr.UnknownValueError:
+                st.session_state.voice_message = "Could not understand the voice input. Please speak clearly and try again."
+            except sr.RequestError:
+                st.session_state.voice_message = "Speech recognition service is temporarily unavailable. Please try again or use text input."
+            except Exception as exc:
+                st.session_state.voice_message = f"Voice input error: {exc}"
 
     if st.session_state.voice_message:
-        st.caption(st.session_state.voice_message)
+        if st.session_state.voice_message == "Voice input captured successfully.":
+            st.success(st.session_state.voice_message)
+        else:
+            st.error(st.session_state.voice_message)
 
     st.divider()
     left, right = st.columns(2)
